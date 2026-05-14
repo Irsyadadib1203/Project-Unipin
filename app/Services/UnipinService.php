@@ -89,10 +89,6 @@ class UnipinService
 
     // ── Public helpers ──────────────────────────────────────────────────────
 
-    /**
-     * Set kredensial tanpa login ulang.
-     * Dipakai oleh controller agar refreshSessionIfNeeded() punya fallback.
-     */
     public function setCredentials(string $email, string $password): void
     {
         $this->email    = $email;
@@ -107,7 +103,6 @@ class UnipinService
         $this->password = $password;
 
         try {
-            // Destroy sesi lama HANYA jika ada, lalu buat baru
             $this->destroySession();
             $this->createSession();
 
@@ -123,7 +118,6 @@ class UnipinService
             $dom->loadHTML($html);
             $xpath = new \DOMXPath($dom);
 
-            // Coba dua kemungkinan form ID
             $form = $xpath->query('//form[@id="signin-form-viaemail"]')->item(0)
                  ?? $xpath->query('//form[@id="signin-form-loginpage"]')->item(0);
 
@@ -165,10 +159,8 @@ class UnipinService
             $formData[$passwordField] = $password;
             $formData['popup']        = '1';
 
-            // POST login
             $this->proxyPost('/login', $formData);
 
-            // Verifikasi login
             $checkResult = $this->proxyGet('/profile');
             $checkHtml   = $checkResult['response'] ?? '';
 
@@ -179,7 +171,6 @@ class UnipinService
             if ($isLoggedIn) {
                 $this->loginTime = time();
 
-                // Simpan ke Laravel session agar bisa dipakai request berikutnya
                 session([
                     'unipin_session_id' => $this->sessionId,
                     'unipin_user'       => $email,
@@ -200,24 +191,14 @@ class UnipinService
 
     // ── Session refresh ─────────────────────────────────────────────────────
 
-    /**
-     * Pastikan sessionId aktif sebelum melakukan request.
-     *
-     * Priority:
-     * 1. Pakai sessionId di object ini (kalau masih dalam 10 menit)
-     * 2. Pakai sessionId dari Laravel session (kalau masih dalam 10 menit)
-     * 3. Login ulang pakai kredensial yang tersimpan
-     */
     protected function refreshSessionIfNeeded(): bool
     {
-        // 1. Object sudah punya session aktif
         if ($this->sessionId && $this->loginTime > 0) {
             if ((time() - $this->loginTime) <= 600) {
                 return true;
             }
         }
 
-        // 2. Coba pakai session Laravel yang disimpan saat login
         $savedSessionId = session('unipin_session_id', '');
         $savedLoginTime = (int) session('unipin_login_time', 0);
 
@@ -235,7 +216,6 @@ class UnipinService
             return true;
         }
 
-        // 3. Tidak ada session valid → login ulang
         $email    = $this->email    ?: session('unipin_email');
         $password = $this->password ?: session('unipin_password');
 
@@ -281,7 +261,7 @@ class UnipinService
             $result = $this->proxyGet("/reload/voucher/{$voucherId}");
             $html   = $result['response'] ?? '';
 
-            // Cek kalau redirect ke halaman login
+            // Cek redirect ke halaman login
             if (str_contains($html, 'UniPin  Masuk') || str_contains($html, 'UniPin Login')) {
                 \Log::warning('UnipinService: session expired saat GET voucher, re-login...');
                 $this->loginTime = 0;
@@ -295,7 +275,7 @@ class UnipinService
                 $html   = $result['response'] ?? '';
             }
 
-            // Ambil CSRF token — coba meta tag dulu, lalu input hidden
+            // Ambil CSRF token
             preg_match('/<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"/i', $html, $metaMatch);
             $token = $metaMatch[1] ?? null;
 
@@ -325,102 +305,183 @@ class UnipinService
                 'pin_4'  => substr($pin, 12, 4),
             ]);
 
-            $html = $redeemResult['response'] ?? '';
-
-            // ── Log response untuk debugging ──
-            preg_match('/<title>(.*?)<\/title>/i', $html, $titleMatch);
-            $title = $titleMatch[1] ?? '';
-
-            // Cari pesan alert (coba berbagai pola class)
-            $alertText = '';
-            $alertPatterns = [
-                '/<div[^>]*class="[^"]*alert[^"]*"[^>]*>(.*?)<\/div>/is',
-                '/<div[^>]*class="[^"]*toast[^"]*"[^>]*>(.*?)<\/div>/is',
-                '/<div[^>]*class="[^"]*message[^"]*"[^>]*>(.*?)<\/div>/is',
-                '/<p[^>]*class="[^"]*alert[^"]*"[^>]*>(.*?)<\/p>/is',
-            ];
-            foreach ($alertPatterns as $pattern) {
-                if (preg_match($pattern, $html, $alertMatch)) {
-                    $alertText = trim(strip_tags($alertMatch[1]));
-                    if ($alertText) break;
-                }
-            }
+            $html        = $redeemResult['response']    ?? '';
+            $finalUrl    = $redeemResult['final_url']   ?? '';  // URL akhir setelah redirect
+            $statusCode  = $redeemResult['status_code'] ?? 0;
 
             \Log::debug('UnipinService redeemKode response', [
-                'kode'    => $kode,
-                'type'    => $type,
-                'title'   => $title,
-                'alert'   => $alertText,
-                'snippet' => substr($html, 0, 2000),
+                'kode'       => $kode,
+                'type'       => $type,
+                'final_url'  => $finalUrl,
+                'status'     => $statusCode,
+                'snippet'    => substr($html, 0, 2000),
             ]);
 
-            // ── Deteksi hasil ──
-            $htmlLower = strtolower($html);
+            // ── DETEKSI SUKSES ──────────────────────────────────────────────
+            //
+            // PRIORITAS 1: Cek URL akhir setelah redirect
+            // UniPin redirect ke /reload/result/... saat sukses
+            $isSuccessByUrl = str_contains($finalUrl, '/reload/result/');
 
-            $successKeywords = [
-                'berhasil', 'success', 'sukses', 'credited', 'topup',
-                'telah ditambahkan', 'reload berhasil', 'voucher berhasil',
-                'successfully', 'added', 'diisi',
-            ];
-            $failKeywords = [
-                'gagal', 'failed', 'invalid', 'tidak valid', 'expired',
-                'sudah digunakan', 'already used', 'not found',
-                'tidak ditemukan', 'habis', 'kadaluarsa',
-            ];
+            // PRIORITAS 2: Cek class HTML spesifik dari halaman result UniPin
+            // Berdasarkan struktur HTML: class="payment-success-badge" dan class="text-success"
+            // yang hanya ada di halaman sukses
+            $isSuccessByClass = str_contains($html, 'class="payment-success-badge"')
+                             || str_contains($html, 'class="checkout-overview text-center"')
+                             || str_contains($html, 'checkout-amount');
 
-            // Khusus: kata "error" hanya dianggap gagal kalau bukan dalam konteks JS/CSS biasa
-            $isSuccess = false;
-            $isFailed  = false;
+            // PRIORITAS 3: Teks spesifik dari halaman result (bukan keyword umum)
+            $isSuccessByText = str_contains($html, 'Transaksi berhasil')
+                            || str_contains($html, 'payment-success-check.svg')
+                            || str_contains($html, 'alt="payment successful"');
 
-            foreach ($successKeywords as $kw) {
-                if (str_contains($htmlLower, $kw)) {
-                    $isSuccess = true;
-                    break;
-                }
-            }
+            // ── DETEKSI GAGAL ───────────────────────────────────────────────
+            //
+            // Cek class/teks spesifik halaman gagal UniPin
+            $isFailByClass = str_contains($html, 'class="payment-failed-badge"')
+                          || str_contains($html, 'checkout-failed')
+                          || str_contains($html, 'payment-failed');
 
-            foreach ($failKeywords as $kw) {
-                if (str_contains($htmlLower, $kw)) {
-                    $isFailed = true;
-                    break;
-                }
-            }
+            // Keyword gagal yang spesifik (hindari false positive dari JS/CSS)
+            $isFailByText = str_contains($html, 'Consumed Voucher')
+                         || str_contains($html, 'Voucher sudah digunakan')
+                         || str_contains($html, 'already used')
+                         || str_contains($html, 'sudah digunakan')
+                         || str_contains($html, 'kadaluarsa')
+                         || str_contains($html, 'Voucher tidak valid')
+                         || str_contains($html, 'not found')
+                         || str_contains($html, 'tidak ditemukan');
 
-            // Sukses menang kalau keduanya ada (misal alert sukses tapi ada kata "error" di JS)
+            $isSuccess = $isSuccessByUrl || $isSuccessByClass || $isSuccessByText;
+            $isFailed  = $isFailByClass  || $isFailByText;
+
+            // Ambil pesan dari halaman result
+            $message    = $this->extractResultMessage($html);
+            $amount     = $this->extractAmount($html);
+            $noTrx      = $this->extractNoTransaksi($html);
+
+            \Log::info('UnipinService deteksi result', [
+                'kode'              => $kode,
+                'is_success_url'    => $isSuccessByUrl,
+                'is_success_class'  => $isSuccessByClass,
+                'is_success_text'   => $isSuccessByText,
+                'is_fail_class'     => $isFailByClass,
+                'is_fail_text'      => $isFailByText,
+                'final_url'         => $finalUrl,
+                'message'           => $message,
+                'amount'            => $amount,
+            ]);
+
+            sleep(3);
+
             if ($isSuccess && !$isFailed) {
-                sleep(3);
                 return [
-                    'success' => true,
-                    'message' => $alertText ?: 'Redeem berhasil',
-                    'kode'    => $kode,
-                    'type'    => $type,
+                    'success'    => true,
+                    'message'    => $message ?: 'Redeem berhasil',
+                    'amount'     => $amount,
+                    'no_transaksi' => $noTrx,
+                    'kode'       => $kode,
+                    'type'       => $type,
                 ];
             }
 
             if ($isFailed) {
-                sleep(3);
                 return [
                     'success' => false,
-                    'message' => $alertText ?: 'Redeem gagal',
+                    'message' => $message ?: 'Redeem gagal',
                     'kode'    => $kode,
                     'type'    => $type,
                 ];
             }
 
-            // Tidak ada keyword yang cocok → kembalikan debug info
-            sleep(3);
+            // Tidak ada sinyal yang jelas → log HTML untuk debug
+            \Log::warning('UnipinService: response tidak dikenali', [
+                'kode'       => $kode,
+                'final_url'  => $finalUrl,
+                'snippet'    => substr($html, 0, 3000),
+            ]);
+
             return [
                 'success'    => false,
                 'message'    => 'Response tidak dikenali — cek log untuk detail',
-                'title'      => $title,
-                'alert'      => $alertText,
+                'final_url'  => $finalUrl,
                 'debug_html' => substr($html, 0, 3000),
+                'kode'       => $kode,
+                'type'       => $type,
             ];
 
         } catch (\Exception $e) {
             sleep(3);
             return ['success' => false, 'message' => $e->getMessage()];
         }
+    }
+
+    // ── Result extractors ───────────────────────────────────────────────────
+
+    /**
+     * Ambil pesan sukses/gagal dari halaman result UniPin.
+     * Contoh: <span class="text-success">Transaksi berhasil, ...</span>
+     */
+    private function extractResultMessage(string $html): string
+    {
+        // Coba ambil dari span.text-success (halaman sukses)
+        if (preg_match('/<span[^>]*class="[^"]*text-success[^"]*"[^>]*>(.*?)<\/span>/is', $html, $m)) {
+            $text = trim(strip_tags($m[1]));
+            if ($text) return $text;
+        }
+
+        // Coba ambil dari div.checkout-payment-name (nama transaksi)
+        if (preg_match('/<div[^>]*class="[^"]*checkout-payment-name[^"]*"[^>]*>(.*?)<\/div>/is', $html, $m)) {
+            $text = trim(strip_tags($m[1]));
+            if ($text) return $text;
+        }
+
+        // Fallback: cari alert biasa
+        $alertPatterns = [
+            '/<div[^>]*class="[^"]*alert[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<div[^>]*class="[^"]*toast[^"]*"[^>]*>(.*?)<\/div>/is',
+            '/<p[^>]*class="[^"]*alert[^"]*"[^>]*>(.*?)<\/p>/is',
+        ];
+
+        foreach ($alertPatterns as $pattern) {
+            if (preg_match($pattern, $html, $m)) {
+                $text = trim(strip_tags($m[1]));
+                if ($text) return $text;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * Ambil nominal dari halaman sukses UniPin.
+     * Contoh: <div class="checkout-amount">IDR 5.000</div>
+     */
+    private function extractAmount(string $html): string
+    {
+        if (preg_match('/<div[^>]*class="[^"]*checkout-amount[^"]*"[^>]*>(.*?)<\/div>/is', $html, $m)) {
+            return trim(strip_tags($m[1]));
+        }
+
+        return '';
+    }
+
+    /**
+     * Ambil nomor transaksi dari halaman sukses UniPin.
+     */
+    private function extractNoTransaksi(string $html): string
+    {
+        // Cari pola UUID di dekat teks "No. Transaksi"
+        if (preg_match('/No\.\s*Transaksi.*?([a-f0-9\-]{30,})/is', $html, $m)) {
+            return trim($m[1]);
+        }
+
+        // Fallback: cari UUID generik
+        if (preg_match('/([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})/i', $html, $m)) {
+            return $m[1];
+        }
+
+        return '';
     }
 
     // ── Parsing ─────────────────────────────────────────────────────────────
@@ -534,6 +595,66 @@ class UnipinService
             'title'        => $titleMatch[1] ?? '',
             'is_logged'    => str_contains($html, 'Logout') || str_contains($html, 'Keluar'),
             'html_snippet' => substr($html, 0, 2000),
+        ];
+    }
+
+    /**
+     * Debug khusus untuk melihat raw response setelah redeem.
+     * Panggil ini dari controller/tinker untuk inspeksi manual.
+     */
+    public function debugRedeem(string $input): array
+    {
+        if (!$this->refreshSessionIfNeeded()) {
+            return ['error' => 'Gagal refresh session'];
+        }
+
+        $parsed = $this->parseKodePin($input);
+        if (isset($parsed['error'])) {
+            return ['error' => $parsed['error']];
+        }
+
+        $voucherId = match($parsed['type']) {
+            'idmb'  => 49,
+            'upgc'  => 50,
+            default => null,
+        };
+
+        if (!$voucherId) {
+            return ['error' => 'Tipe tidak dikenali: ' . $parsed['type']];
+        }
+
+        $pageResult = $this->proxyGet("/reload/voucher/{$voucherId}");
+        $html       = $pageResult['response'] ?? '';
+
+        preg_match('/<meta[^>]*name="csrf-token"[^>]*content="([^"]+)"/i', $html, $metaMatch);
+        $token = $metaMatch[1] ?? null;
+        if (!$token) {
+            preg_match('/<input[^>]*name="_token"[^>]*value="([^"]+)"/i', $html, $tokenMatch);
+            $token = $tokenMatch[1] ?? null;
+        }
+
+        $pin = preg_replace('/[\s\-]/', '', $parsed['pin']);
+
+        $redeemResult = $this->proxyPost("/reload/voucher/{$voucherId}", [
+            '_token' => $token,
+            'serial' => $parsed['kode'],
+            'pin_1'  => substr($pin, 0, 4),
+            'pin_2'  => substr($pin, 4, 4),
+            'pin_3'  => substr($pin, 8, 4),
+            'pin_4'  => substr($pin, 12, 4),
+        ]);
+
+        return [
+            'parsed'         => $parsed,
+            'token'          => $token,
+            'final_url'      => $redeemResult['final_url']   ?? '(tidak ada)',
+            'status_code'    => $redeemResult['status_code'] ?? '(tidak ada)',
+            'has_success_badge' => str_contains($redeemResult['response'] ?? '', 'payment-success-badge'),
+            'has_success_text'  => str_contains($redeemResult['response'] ?? '', 'Transaksi berhasil'),
+            'has_checkout_amt'  => str_contains($redeemResult['response'] ?? '', 'checkout-amount'),
+            'amount'         => $this->extractAmount($redeemResult['response'] ?? ''),
+            'message'        => $this->extractResultMessage($redeemResult['response'] ?? ''),
+            'html_snippet'   => substr($redeemResult['response'] ?? '', 0, 3000),
         ];
     }
 }
