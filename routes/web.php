@@ -39,3 +39,15 @@ Route::get('/test-redeem', function () {
         'html_snippet'=> $result['html_snippet'],
     ]);
 });
+
+Route::prefix('unipin')->group(function () {
+    Route::get('/',              [App\Http\Controllers\UnipinController::class, 'index']);
+    Route::post('/login',        [App\Http\Controllers\UnipinController::class, 'login']);
+    Route::post('/redeem',       [App\Http\Controllers\UnipinController::class, 'redeem']);
+ 
+    // Job storage
+    Route::get('/jobs',          [App\Http\Controllers\UnipinController::class, 'getJobs']);
+    Route::post('/jobs/add',     [App\Http\Controllers\UnipinController::class, 'addJobs']);
+    Route::patch('/jobs/{id}',   [App\Http\Controllers\UnipinController::class, 'updateJob']);
+    Route::delete('/jobs',       [App\Http\Controllers\UnipinController::class, 'clearJobs']);
+});
